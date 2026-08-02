@@ -398,7 +398,7 @@ def api_generate():
     生成回声
     支持三种输入：
     1. text: 文字直接输入
-    2. image: 图片（base64），自动识别 + 生成叙事
+    2. image / doodle: 图片或涂鸦（base64），自动识别 + 生成叙事
     3. voice: 语音（binary），自动转文字 + 生成叙事
     """
     data = request.get_json() or {}
@@ -412,15 +412,19 @@ def api_generate():
             return jsonify({"error": "内容不能为空"}), 400
         narrative = generate_narrative(user_content)
 
-    # ---- 图片输入 ----
-    elif input_type == "image":
+    # ---- 图片 / 涂鸦输入 ----
+    elif input_type in ("image", "doodle"):
         img_b64 = data.get("content", "")  # base64 字符串
         if not img_b64:
-            return jsonify({"error": "图片不能为空"}), 400
+            return jsonify({"error": "图片或涂鸦不能为空"}), 400
         try:
-            image_data = base64.b64decode(img_b64)
+            # 浏览器 FileReader/canvas 导出的内容是 data:image/...;base64,...
+            # 去掉前缀后再严格解码，避免把 MIME 元数据当作图像字节。
+            if img_b64.startswith("data:"):
+                img_b64 = img_b64.split(",", 1)[1]
+            image_data = base64.b64decode(img_b64, validate=True)
         except Exception:
-            return jsonify({"error": "图片格式错误"}), 400
+            return jsonify({"error": "图片或涂鸦格式错误"}), 400
         narrative = process_image(image_data)
 
     # ---- 语音输入 ----
