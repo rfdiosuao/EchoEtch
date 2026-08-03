@@ -56,11 +56,12 @@
 | 功能 | 状态 | 说明 |
 |------|:----:|------|
 | 每日主题 | ✅ | 10 种主题轮换（情绪觉察 / 细节捕捉 / 感恩回顾等） |
-| 文字输入 | ✅ | 核心输入方式，支持任意长度 |
-| 拍照上传 | ✅ | 视觉模型识别图片内容，生成叙事 |
+| 文字输入 | ✅ | 最多 20,000 字；长文本走后台分段生成与合并 |
+| 拍照 / 涂鸦 | ✅ | 识别画面生成叙事，并保留用户原图 |
 | 语音输入 | ✅ | Whisper 语音转文字 → 叙事生成 |
 | AI 叙事生成 | ✅ | LLM 生成 100-150 字冥想式文本 |
-| TTS 语音合成 | ✅ | db.heang.top 接口，温柔女声音色 |
+| AI 图片生成 | ✅ | 独立 OpenAI 兼容接口；未配置时保留原图或跳过生图 |
+| TTS 语音合成 | ✅ | 小米 MiMo 公共 API，支持长文本分段合成为本地 WAV |
 | 回声卡片 | ✅ | 叙事展示 + 音频播放 |
 | 回声日记 | ✅ | 日历视图 + 按日浏览历史记录 |
 | Demo 模式 | ✅ | 无需任何 API Key 即可体验完整流程 |
@@ -73,7 +74,7 @@
 
 ### 环境要求
 
-- Python 3.8+
+- Python 3.10+
 - pip
 
 ### 安装与运行
@@ -81,18 +82,24 @@
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/rfdiosuao/EchoEtch.git
-cd EchoEtch/demo/backend
+cd EchoEtch
 
 # 2. 安装依赖
-pip install -r requirements.txt
+pip install -r demo/backend/requirements.txt
 
 # 3. 启动服务
-python app.py
+python demo/backend/app.py
 ```
 
 打开浏览器访问 **http://localhost:8721** 即可。
 
 > 手机访问：将 `localhost` 替换为电脑局域网 IP，如 `http://192.168.x.x:8721`
+
+### 运行测试
+
+```bash
+python -m unittest discover -s demo/backend -p "test*.py" -v
+```
 
 ### macOS / Linux 一键启动
 
@@ -124,19 +131,27 @@ OPENAI_MODEL_TEXT=Qwen/Qwen2.5-72B-Instruct
 # ---- 语音识别 Whisper ----
 WHISPER_URL=https://api.siliconflow.cn/v1
 WHISPER_API_KEY=sk-your-key
+WHISPER_MODEL=FunAudioLLM/SenseVoiceSmall
 
-# ---- TTS 语音合成 ----
-DOBAO_TTS_URL=https://db.heang.top
-DOBAO_TTS_USER=heang
-DOBAO_TTS_PASSWORD=your-password
-DOBAO_TTS_VOICE=zh_female_wenroutaozi_uranus_bigtts
+# ---- 独立图片生成（可选）----
+IMAGE_API_KEY=sk-your-key
+IMAGE_BASE_URL=https://api.heang.top/v1
+IMAGE_MODEL=gpt-image-2
+
+# ---- TTS 语音合成（小米 MiMo 公共 API）----
+MIMO_TTS_BASE_URL=https://api.xiaomimimo.com/v1
+MIMO_TTS_API_KEY=sk-your-key
+MIMO_TTS_MODEL=mimo-v2.5-tts
+MIMO_TTS_VOICE=茉莉                    # 可选: mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean
+MIMO_TTS_TIMEOUT=120
 ```
 
 | 配置项 | 用途 | 未配置时 |
 |--------|------|---------|
 | `OPENAI_API_KEY` | LLM 叙事生成 + 视觉模型 | Demo 模式，返回预设叙事 |
 | `WHISPER_API_KEY` | 语音转文字 | 返回占位文本 `[语音录入]` |
-| `DOBAO_TTS_PASSWORD` | TTS 音频合成 | 跳过音频，仅展示文字 |
+| `IMAGE_API_KEY` | 根据叙事或参考图生成插画 | 保留原始图片或跳过生图 |
+| `MIMO_TTS_API_KEY` | TTS 音频合成（小米 MiMo） | 跳过音频，仅展示文字 |
 
 > **推荐**：[硅基流动 SiliconFlow](https://siliconflow.cn) 提供 OpenAI 兼容接口，国内可用，免费额度覆盖 Qwen 系列模型。
 
@@ -149,13 +164,15 @@ EchoEtch/
 ├── demo/
 │   ├── backend/
 │   │   ├── app.py              # Flask 后端（单文件，含全部路由和业务逻辑）
-│   │   └── requirements.txt    # Python 依赖
+│   │   ├── requirements.txt    # Python 依赖
+│   │   └── test_app.py         # MiMo TTS 与上游流程回归测试
 │   ├── frontend/
 │   │   ├── index.html          # 前端页面（移动端优先，原生 HTML/CSS/JS）
 │   │   └── tailwind.min.js     # Tailwind CSS（本地引入）
 │   ├── data/
 │   │   ├── diary.json          # 回声日记数据（JSON 文件存储）
-│   │   └── audio/              # TTS 生成的音频文件
+│   │   ├── audio/              # TTS 生成的音频文件（不提交）
+│   │   └── images/             # 上传及生成的图片（不提交）
 │   └── start.sh                # macOS / Linux 启动脚本
 ├── .env.example                # 环境变量模板
 ├── .gitignore
@@ -174,7 +191,8 @@ EchoEtch/
 | 前端 | HTML / CSS / JS | 移动端优先，Tailwind CSS |
 | LLM | Qwen2-VL-72B / Qwen2.5-72B | 通过 SiliconFlow OpenAI 兼容接口调用 |
 | 语音识别 | Whisper (SenseVoice) | SiliconFlow 平台，中文优化 |
-| 语音合成 | db.heang.top TTS | 豆包 TTS 接口，温柔女声音色 |
+| 图片生成 | OpenAI 兼容 Images API | 与叙事模型密钥独立配置 |
+| 语音合成 | 小米 MiMo TTS | 小米公共 API，温柔女声音色 |
 | 配置管理 | python-dotenv | 从 `.env` 文件加载环境变量 |
 
 ---
@@ -185,8 +203,11 @@ EchoEtch/
 |------|------|------|
 | `GET` | `/api/status` | 后端配置状态（Demo 模式检测） |
 | `GET` | `/api/theme/today` | 获取今日主题 |
-| `POST` | `/api/echo/generate` | 生成回声（文字 / 图片） |
+| `POST` | `/api/echo/generate` | 生成回声（文字 / 图片 / 涂鸦） |
 | `POST` | `/api/echo/voice` | 语音输入 → 转文字 → 生成叙事 |
+| `GET` | `/api/echo/jobs/{job_id}` | 查询长文本后台任务状态 |
+| `GET` | `/api/audio/{filename}` | 读取生成的 TTS 音频 |
+| `GET` | `/api/images/{filename}` | 读取上传或生成的图片 |
 | `GET` | `/api/diary` | 获取全部日记（按日期倒序） |
 | `GET` | `/api/diary/{date}` | 获取指定日期的回声 |
 | `GET` | `/preview` | 路演演示页面 |
@@ -222,7 +243,7 @@ curl -X POST http://localhost:8721/api/echo/voice \
 当前 Demo                    生产级目标
 ───────────                 ───────────
 Flask + JSON    ──→         FastAPI + PostgreSQL + Redis
-edge-tts / 整段  ──→         豆包 V3 流式 TTS (WebSocket)
+MiMo TTS / 本地 WAV ──→       豆包 V3 流式 TTS (WebSocket)
 单文件 HTML     ──→         Vue 3 SPA + 组件化
 无认证          ──→         JWT Bearer Token
 debug=True     ──→         Nginx + waitress 生产部署

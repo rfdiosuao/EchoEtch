@@ -42,6 +42,7 @@ yarn.lock
 demo/data/audio/*.mp3
 demo/data/audio/*.wav
 demo/data/audio/*.webm
+demo/data/images/
 
 # ===== Temp =====
 *.tmp

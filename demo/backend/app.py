@@ -6,10 +6,10 @@ from __future__ import annotations
 依赖安装：
   pip install flask flask-cors python-dotenv requests Pillow
 
-API Key 配置（任选一种）：
-  1. 硅基流动（国内，推荐）：https://siliconflow.cn
-  2. OpenAI API（需要代理）
-  3. 其他 OpenAI 兼容接口
+API Key 配置：
+  LLM: 硅基流动 Qwen（OpenAI 兼容接口，国内可用）
+  ASR: 硅基流动 Whisper（语音转文字）
+  TTS: 小米 MiMo（公共 API，OpenAI 兼容 chat/completions）
 
 环境变量设置：
   export OPENAI_API_KEY="sk-xxx"
@@ -18,23 +18,29 @@ API Key 配置（任选一种）：
   export OPENAI_MODEL_TEXT="Qwen/Qwen2.5-72B-Instruct"       # 文本模型
   export WHISPER_URL="https://api.siliconflow.cn/v1"        # Whisper API（硅基流动）
   export WHISPER_API_KEY="sk-xxx"
-  export DOBAO_TTS_URL="https://db.heang.top"               # db.heang.top TTS 接口地址
-  export DOBAO_TTS_USER="heang"                              # TTS 用户名
-  export DOBAO_TTS_PASSWORD=""                               # TTS 密码（必填，否则 TTS 不可用）
-  export DOBAO_TTS_VOICE="zh_female_wenroutaozi_uranus_bigtts"  # TTS 音色
+  export MIMO_TTS_API_KEY="sk-xxx"                            # 小米 MiMo TTS
+  export MIMO_TTS_VOICE="茉莉"                                # 音色: mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean
 """
 
 import os
 import io
+import sys
 import json
 import uuid
 import base64
 import hashlib
 import datetime
 import re
-import subprocess
 import threading
+import wave
 from pathlib import Path
+
+# Windows 控制台默认 GBK,无法打印 ✓/⚠ 等 Unicode 符号,统一重配 UTF-8
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # 加载 .env 文件（优先级：系统环境变量 > .env 文件）
 try:
@@ -76,25 +82,25 @@ IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "")
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "https://api.heang.top/v1").rstrip("/")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2")
 
-# db.heang.top TTS 配置
-DOBAO_TTS_URL = os.getenv("DOBAO_TTS_URL", "https://db.heang.top")
-DOBAO_TTS_USER = os.getenv("DOBAO_TTS_USER", "heang")
-DOBAO_TTS_PASSWORD = os.getenv("DOBAO_TTS_PASSWORD", "")
-DOBAO_TTS_VOICE = os.getenv("DOBAO_TTS_VOICE", "zh_female_wenroutaozi_uranus_bigtts")
+# 小米 MiMo TTS 配置
+MIMO_TTS_BASE_URL = os.getenv("MIMO_TTS_BASE_URL", "https://api.xiaomimimo.com/v1")
+MIMO_TTS_API_KEY = os.getenv("MIMO_TTS_API_KEY", "")
+MIMO_TTS_MODEL = os.getenv("MIMO_TTS_MODEL", "mimo-v2.5-tts")
+MIMO_TTS_VOICE = os.getenv("MIMO_TTS_VOICE", "茉莉")  # 可选: mimo_default, 冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean
 
 # 启动时打印配置状态
 print("=" * 50)
 print("《聲畫合鳴》v2 - 完整版（含图片识别+语音转文字）")
 print("=" * 50)
-_demo = not (OPENAI_API_KEY and WHISPER_API_KEY and DOBAO_TTS_PASSWORD)
+_demo = not (OPENAI_API_KEY and WHISPER_API_KEY and MIMO_TTS_API_KEY)
 if _demo:
     print(f"⚠ LLM: {'已配置' if OPENAI_API_KEY else '未配置 API Key，运行 Demo 模式'}")
     print(f"⚠ Whisper: {'已配置' if WHISPER_API_KEY else '未配置 API Key，语音识别用占位文本'}")
-    print(f"✗ TTS: {'已配置' if DOBAO_TTS_PASSWORD else '未配置 DOBAO_TTS_PASSWORD，音频不可用'}")
+    print(f"⚠ TTS: {'已配置' if MIMO_TTS_API_KEY else '未配置 MIMO_TTS_API_KEY，音频不可用'}")
 else:
     print("✓ LLM: 已配置")
     print("✓ Whisper: 已配置")
-    print("✓ TTS: 已配置")
+    print("✓ TTS: 已配置 (小米 MiMo)")
     print("访问地址：http://localhost:8721")
 
 # 数据存储
@@ -380,28 +386,47 @@ def transcribe_audio(audio_data: bytes, filename="voice.webm") -> str:
 
 
 # ========================
-# TTS 音频生成
+# TTS 音频生成（小米 MiMo 公共 API，走 chat/completions）
 # ========================
-def _generate_tts_chunk(text: str) -> str | None:
-    """生成不超过 5000 字的单段音频。"""
-    if not DOBAO_TTS_PASSWORD:
-        print("[TTS] 未配置 DOBAO_TTS_PASSWORD，跳过 TTS 生成")
+TTS_TONE_PROMPT = os.getenv(
+    "MIMO_TTS_TONE_PROMPT",
+    "温柔、平静、像深夜电台独白一样的语气，节奏缓慢，带有治愈感和陪伴感",
+)
+MIMO_TTS_TIMEOUT = int(os.getenv("MIMO_TTS_TIMEOUT", "120"))
+
+
+def _generate_tts_chunk(text: str) -> bytes | None:
+    """MiMo adapter：合成一段 WAV，返回音频字节。"""
+    if not MIMO_TTS_API_KEY:
+        print("[TTS] 未配置 MIMO_TTS_API_KEY，跳过 TTS 生成")
         return None
 
     try:
-        auth = base64.b64encode(f"{DOBAO_TTS_USER}:{DOBAO_TTS_PASSWORD}".encode()).decode()
         resp = requests.post(
-            f"{DOBAO_TTS_URL}/api/tts",
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            json={"text": text, "speaker": DOBAO_TTS_VOICE, "rate": 0, "pitch": 0},
-            timeout=90,
+            f"{MIMO_TTS_BASE_URL.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {MIMO_TTS_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MIMO_TTS_MODEL,
+                "messages": [
+                    {"role": "user", "content": TTS_TONE_PROMPT},
+                    {"role": "assistant", "content": text},
+                ],
+                "audio": {"voice": MIMO_TTS_VOICE, "format": "wav"},
+            },
+            timeout=MIMO_TTS_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json().get("data", resp.json())
-        audio_url = data.get("storageUrl") or data.get("url") or data.get("local_url")
-        if audio_url and audio_url.startswith("/"):
-            audio_url = f"{DOBAO_TTS_URL}{audio_url}"
-        return audio_url
+        audio_b64 = resp.json()["choices"][0]["message"]["audio"]["data"]
+        if audio_b64.startswith("data:"):
+            audio_b64 = audio_b64.split(",", 1)[1]
+        audio_bytes = base64.b64decode(audio_b64, validate=True)
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            if wav_file.getnframes() <= 0:
+                raise ValueError("MiMo 返回了空 WAV 音频")
+        return audio_bytes
     except Exception as exc:
         print(f"[TTS 分段失败] {exc}")
         return None
@@ -424,47 +449,50 @@ def _split_tts_text(text: str, limit: int = 4500) -> list[str]:
     return chunks
 
 
+def _merge_wav_chunks(audio_chunks: list[bytes]) -> bytes:
+    """用 Python 标准库拼接参数一致的 WAV，避免依赖系统 ffmpeg。"""
+    output = io.BytesIO()
+    expected_format = None
+    with wave.open(output, "wb") as target:
+        for audio_bytes in audio_chunks:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as source:
+                audio_format = (
+                    source.getnchannels(), source.getsampwidth(), source.getframerate(),
+                    source.getcomptype(), source.getcompname(),
+                )
+                if expected_format is None:
+                    expected_format = audio_format
+                    target.setnchannels(source.getnchannels())
+                    target.setsampwidth(source.getsampwidth())
+                    target.setframerate(source.getframerate())
+                    target.setcomptype(source.getcomptype(), source.getcompname())
+                elif audio_format != expected_format:
+                    raise ValueError("MiMo 分段音频参数不一致，无法安全拼接")
+                target.writeframes(source.readframes(source.getnframes()))
+    return output.getvalue()
+
+
 def generate_tts(text: str) -> str | None:
-    """长文顺序分段生成；多段时合并为一个可播放 MP3。"""
+    """长文顺序分段生成；多段时合并为一个本地 WAV。"""
     chunks = _split_tts_text(text)
     if not chunks:
         return None
-    urls = []
+    audio_chunks = []
     for index, chunk in enumerate(chunks, 1):
         print(f"[TTS] 正在生成第 {index}/{len(chunks)} 段，{len(chunk)} 字")
-        url = _generate_tts_chunk(chunk)
-        if not url:
+        audio_bytes = _generate_tts_chunk(chunk)
+        if not audio_bytes:
             return None
-        urls.append(url)
-    if len(urls) == 1:
-        return urls[0]
+        audio_chunks.append(audio_bytes)
 
-    merge_id = uuid.uuid4().hex
-    parts = []
-    list_file = AUDIO_DIR / f".{merge_id}.txt"
-    output_file = AUDIO_DIR / f"{merge_id}.mp3"
     try:
-        for index, url in enumerate(urls):
-            part = AUDIO_DIR / f".{merge_id}-{index}.mp3"
-            response = requests.get(url, timeout=90)
-            response.raise_for_status()
-            part.write_bytes(response.content)
-            parts.append(part)
-        list_file.write_text("".join(f"file '{part}'\n" for part in parts), encoding="utf-8")
-        subprocess.run(
-            ["/usr/bin/ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(output_file)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120,
-        )
+        audio_bytes = audio_chunks[0] if len(audio_chunks) == 1 else _merge_wav_chunks(audio_chunks)
+        output_file = AUDIO_DIR / f"{uuid.uuid4().hex}.wav"
+        output_file.write_bytes(audio_bytes)
         return f"/api/audio/{output_file.name}"
     except Exception as exc:
         print(f"[TTS 合并失败] {exc}")
         return None
-    finally:
-        for path in [*parts, list_file]:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
 
 
 def _run_long_text_job(job_id: str, user_content: str, theme: str):
@@ -621,7 +649,7 @@ def api_status():
         "demo_mode": demo_mode,
         "has_api_key": bool(OPENAI_API_KEY),
         "has_whisper": bool(WHISPER_API_KEY),
-        "has_tts": bool(DOBAO_TTS_PASSWORD),
+        "has_tts": bool(MIMO_TTS_API_KEY),
         "has_image_generation": bool(IMAGE_API_KEY),
         "message": "Demo 模式：语音识别和 TTS 使用占位文本" if demo_mode else "正常模式",
     })
@@ -833,10 +861,10 @@ if __name__ == "__main__":
             print("✗ Whisper: 未配置（语音转文字不可用）")
     else:
         print("⚠ LLM: 未配置 API Key，运行 Demo 模式")
-    if DOBAO_TTS_PASSWORD:
-        print(f"✓ TTS: {DOBAO_TTS_URL} (音色: {DOBAO_TTS_VOICE})")
+    if MIMO_TTS_API_KEY:
+        print(f"✓ TTS: 小米 MiMo (音色: {MIMO_TTS_VOICE})")
     else:
-        print("✗ TTS: 未配置 DOBAO_TTS_PASSWORD")
+        print("✗ TTS: 未配置 MIMO_TTS_API_KEY")
     print(f"访问地址：http://localhost:8721")
     print("=" * 44)
     app.run(host="0.0.0.0", port=8721, debug=True)
