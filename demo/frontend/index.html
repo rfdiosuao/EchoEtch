@@ -216,6 +216,7 @@ main { flex: 1; position: relative; overflow: hidden; }
   overflow: hidden; flex-shrink: 0;
 }
 .entry-thumb svg { width: 100%; height: 100%; }
+.entry-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
 .entry-body {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column; justify-content: center;
@@ -720,6 +721,7 @@ main { flex: 1; position: relative; overflow: hidden; }
   overflow: hidden; flex-shrink: 0;
 }
 .arch-thumb svg { width: 100%; height: 100%; }
+.arch-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
 .arch-info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
 .arch-info .atitle {
   font-family: var(--font-display);
@@ -1187,7 +1189,21 @@ async function readApiResponse(r){
 }
 async function apiGenerate(type, content, theme){
   const r=await fetch(API_BASE+'/api/echo/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type,content:content,theme:theme})});
-  return readApiResponse(r);
+  const data=await readApiResponse(r);
+  if(data.pending && data.job_id)return waitForEchoJob(data.job_id);
+  return data;
+}
+async function waitForEchoJob(jobId){
+  const label=document.getElementById('sproutLabel1');
+  if(label)label.textContent='长文正在分段朗读并合并，请耐心等待...';
+  for(let attempt=0;attempt<450;attempt++){
+    await wait(2000);
+    const r=await fetch(API_BASE+'/api/echo/jobs/'+encodeURIComponent(jobId),{cache:'no-store'});
+    const data=await readApiResponse(r);
+    if(data.status==='completed')return data;
+    if(data.status==='failed')throw new Error(data.error||'长文音频生成失败');
+  }
+  throw new Error('长文生成超时，请稍后在日历中查看');
 }
 async function apiGenerateVoice(blob, theme){
   const form=new FormData();
@@ -1229,6 +1245,14 @@ const thumbSVG = {
   wood: '<svg viewBox="0 0 52 52" xmlns="http://www.w3.org/2000/svg"><rect width="52" height="52" fill="var(--illus-moon)"/><circle cx="38" cy="12" r="6" fill="var(--illus-sun)" opacity="0.2"/><path d="M12 40 Q15 32,18 36 T24 28 L28 40Z" fill="var(--illus-leaf)" opacity="0.2"/></svg>',
 };
 
+function historyThumb(entry){
+  if(entry.image_url){
+    const safe=String(entry.image_url).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    return '<img src="'+safe+'" alt="回声生成图" loading="lazy">';
+  }
+  return thumbSVG[entry.stage] || thumbSVG.bloom;
+}
+
 const heroSVGs = {
   bloom: '<svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2D3040"/><stop offset="0.6" stop-color="#3A2E48"/><stop offset="1" stop-color="#4A3F35"/></linearGradient><radialGradient id="glow"><stop offset="0" stop-color="#F5E8D4" stop-opacity="0.25"/><stop offset="1" stop-color="#F5E8D4" stop-opacity="0"/></radialGradient></defs><rect width="400" height="225" fill="url(#sk)"/><circle cx="200" cy="100" r="90" fill="url(#glow)"/><circle cx="200" cy="100" r="55" fill="none" stroke="#F5E8D4" stroke-width="1" opacity="0.15"/><circle cx="200" cy="100" r="38" fill="none" stroke="#F5E8D4" stroke-width="1" opacity="0.2"/><circle cx="200" cy="100" r="22" fill="none" stroke="#F5E8D4" stroke-width="1" opacity="0.3"/><path d="M200 82 Q194 84 192 78 Q190 82 194 84 Q192 84 192 88 Q200 94 208 88 Q208 84 206 84 Q210 82 208 78 Q206 84 200 82Z" fill="#F5E8D4" opacity="0.85"/><path d="M183 94 Q180 108 184 120 Q190 130 200 132 Q210 130 216 120 Q220 108 217 94 Q210 102 200 102 Q190 102 183 94Z" fill="#F5E8D4" opacity="0.7"/><path d="M175 100 Q173 115 178 128" stroke="#F5E8D4" stroke-width="1.5" fill="none" opacity="0.5" stroke-linecap="round"/><path d="M225 100 Q227 115 222 128" stroke="#F5E8D4" stroke-width="1.5" fill="none" opacity="0.5" stroke-linecap="round"/><ellipse cx="200" cy="180" rx="45" ry="6" fill="#F5E8D4" opacity="0.08"/><ellipse cx="200" cy="178" rx="28" ry="4" fill="#F5E8D4" opacity="0.12"/><circle cx="320" cy="40" r="20" fill="#F5E8D4" opacity="0.12"/><circle cx="80" cy="30" r="1" fill="#F5E8D4" opacity="0.4"/><circle cx="350" cy="60" r="0.8" fill="#F5E8D4" opacity="0.3"/><circle cx="50" cy="50" r="0.7" fill="#F5E8D4" opacity="0.3"/></svg>',
   bud: '<svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sk2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E8DFD0"/><stop offset="0.5" stop-color="#F0E4D0"/><stop offset="1" stop-color="#D4E8E0"/></linearGradient></defs><rect width="400" height="225" fill="url(#sk2)"/><circle cx="200" cy="95" r="70" fill="#9CB8C8" opacity="0.08"/><circle cx="200" cy="95" r="45" fill="#9CB8C8" opacity="0.06"/><path d="M195 130 Q185 120 188 105 Q195 95 200 100 Q205 95 212 105 Q215 120 205 130 Q200 135 195 130Z" fill="#8CCBB8" opacity="0.5"/><path d="M200 105 Q198 95 200 85 Q202 95 200 105Z" fill="#E8B4BC" opacity="0.45"/><path d="M180 115 Q175 108 178 98 Q185 92 188 100" fill="#8CCBB8" opacity="0.35"/><path d="M220 115 Q225 108 222 98 Q215 92 212 100" fill="#8CCBB8" opacity="0.35"/><ellipse cx="200" cy="175" rx="55" ry="5" fill="#9CB8C8" opacity="0.1"/><ellipse cx="200" cy="172" rx="35" ry="3" fill="#9CB8C8" opacity="0.15"/><path d="M165 155 Q200 150 235 155" stroke="#9CB8C8" stroke-width="1" fill="none" opacity="0.2"/><path d="M155 165 Q200 160 245 165" stroke="#9CB8C8" stroke-width="1" fill="none" opacity="0.15"/><circle cx="200" cy="50" r="3" fill="#F5E8D4" opacity="0.5"/></svg>',
@@ -1266,7 +1290,7 @@ function renderTimeline() {
       <div class="timeline-month-label">${m.month}</div>
       ${m.entries.map(e => `
         <div class="timeline-entry" data-stage="${e.stage}" data-audio="${e.audio_url||''}" data-component="Timeline Entry">
-          <div class="entry-thumb">${thumbSVG[e.stage]}</div>
+          <div class="entry-thumb">${historyThumb(e)}</div>
           <div class="entry-body">
             <div class="entry-meta">
               <span class="entry-date">${e.date}</span>
@@ -1307,6 +1331,7 @@ async function loadTimelineData() {
           input: inputLabels[rec.input_type] || '文字',
           dur: '00:00',
           audio_url: rec.audio_url || '',
+          image_url: rec.image_url || '',
           narrative: n,
           theme: rec.theme || '',
           inputType: rec.input_type || 'text'
@@ -1363,7 +1388,7 @@ function renderArchive() {
   }
   let html = all.map(e => `
     <div class="arch-entry" data-stage="${e.stage}" data-component="Archive Entry">
-      <div class="arch-thumb">${thumbSVG[e.stage]}</div>
+      <div class="arch-thumb">${historyThumb(e)}</div>
       <div class="arch-info">
         <p class="atitle">${e.title}</p>
         <div class="ameta">
@@ -1405,13 +1430,13 @@ document.getElementById('archBody').addEventListener('click', e => {
   const stage = entry.dataset.stage;
   const title = entry.querySelector('.atitle').textContent;
   const date = entry.querySelector('.ameta span').textContent;
-  let narrative = '', audioUrl = '', inputType = 'text';
+  let narrative = '', audioUrl = '', inputType = 'text', imageUrl = null;
   for (const m of timelineData) {
     for (const ent of m.entries) {
-      if (ent.date === date && ent.title === title) { narrative = ent.narrative || ''; audioUrl = ent.audio_url || ''; inputType = ent.inputType || 'text'; break; }
+      if (ent.date === date && ent.title === title) { narrative = ent.narrative || ''; audioUrl = ent.audio_url || ''; inputType = ent.inputType || 'text'; imageUrl = ent.image_url || null; break; }
     }
   }
-  showEchoCard(stage, title, date, narrative, audioUrl, inputType);
+  showEchoCard(stage, title, date, narrative, audioUrl, inputType, imageUrl);
 });
 
 function showEchoCard(stage, title, date, narrative, audioUrl, inputType, imageUrl) {
@@ -1703,21 +1728,28 @@ for(let i=0;i<45;i++){const b=document.createElement('div');b.className='bar';b.
 function setupAudio(url){
   if(audioEl){try{audioEl.pause();}catch(e){}}
   if(!url){audioEl=null;return;}
-  audioEl=new Audio(url);
-  audioEl.addEventListener('timeupdate',()=>{
-    if(!audioEl.duration)return;
-    const pct=(audioEl.currentTime/audioEl.duration)*100;
+  const player=new Audio(url);
+  audioEl=player;
+  player.preload='metadata';
+  player.addEventListener('timeupdate',()=>{
+    if(audioEl!==player || !player.duration)return;
+    const pct=(player.currentTime/player.duration)*100;
     pFill.style.width=pct+'%';
-    pCur.textContent=fmtT(audioEl.currentTime);
+    pCur.textContent=fmtT(player.currentTime);
     const n=Math.floor((pct/100)*pWave.children.length);
     Array.from(pWave.children).forEach((b,i)=>{b.classList.toggle('on',i<n);});
   });
-  audioEl.addEventListener('loadedmetadata',()=>{
-    const durEl=document.querySelector('.pdur');
-    if(durEl) durEl.textContent=fmtT(audioEl.duration);
+  player.addEventListener('loadedmetadata',()=>{
+    if(audioEl!==player)return;
+    document.querySelectorAll('.pdur').forEach(el=>{el.textContent=fmtT(player.duration);});
   });
-  audioEl.addEventListener('ended',()=>{
+  player.addEventListener('ended',()=>{
+    if(audioEl!==player)return;
     playing=false;
+    try{player.currentTime=0;}catch(e){}
+    pFill.style.width='0%';
+    pCur.textContent='00:00';
+    Array.from(pWave.children).forEach(b=>b.classList.remove('on'));
     pBtn.innerHTML='<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2l10 6-10 6V2z"/></svg>';
   });
 }
@@ -1728,9 +1760,18 @@ pBtn.addEventListener('click',()=>{
 });
 function startP(){
   if(!audioEl)return;
+  if(audioEl.ended || (audioEl.duration && audioEl.currentTime>=audioEl.duration-0.05)){
+    try{audioEl.currentTime=0;}catch(e){}
+  }
   playing=true;
   pBtn.innerHTML='<svg viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3" width="3" height="10" rx="1"/><rect x="9.5" y="3" width="3" height="10" rx="1"/></svg>';
-  audioEl.play();
+  const playPromise=audioEl.play();
+  if(playPromise && typeof playPromise.catch==='function'){
+    playPromise.catch(()=>{
+      playing=false;
+      pBtn.innerHTML='<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2l10 6-10 6V2z"/></svg>';
+    });
+  }
 }
 function pauseP(){
   if(!audioEl)return;
@@ -1744,6 +1785,7 @@ function resetP(){
   pBtn.innerHTML='<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2l10 6-10 6V2z"/></svg>';
   pFill.style.width='0%';
   pCur.textContent='00:00';
+  Array.from(pWave.children).forEach(b=>b.classList.remove('on'));
 }
 const resetPlayer = resetP;
 

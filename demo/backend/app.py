@@ -29,7 +29,11 @@ import io
 import json
 import uuid
 import base64
+import hashlib
 import datetime
+import re
+import subprocess
+import threading
 from pathlib import Path
 
 # 加载 .env 文件（优先级：系统环境变量 > .env 文件）
@@ -65,6 +69,12 @@ MODEL_VISION = os.getenv("OPENAI_MODEL", "Qwen/Qwen2-VL-72B-Instruct")
 MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "Qwen/Qwen2.5-72B-Instruct")
 WHISPER_URL = os.getenv("WHISPER_URL", "https://api.siliconflow.cn/v1")
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "") or OPENAI_API_KEY
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "FunAudioLLM/SenseVoiceSmall")
+
+# 独立的生图接口配置（不复用 LLM 密钥，避免影响现有叙事/语音链路）
+IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "")
+IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "https://api.heang.top/v1").rstrip("/")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2")
 
 # db.heang.top TTS 配置
 DOBAO_TTS_URL = os.getenv("DOBAO_TTS_URL", "https://db.heang.top")
@@ -93,7 +103,12 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 AUDIO_DIR = DATA_DIR / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+IMAGE_DIR = DATA_DIR / "images"
+IMAGE_DIR.mkdir(exist_ok=True)
 DIARY_FILE = DATA_DIR / "diary.json"
+DIARY_LOCK = threading.Lock()
+TTS_JOBS = {}
+TTS_JOBS_LOCK = threading.Lock()
 
 
 def load_diary():
@@ -103,16 +118,24 @@ def load_diary():
 def save_diary(diary):
     DIARY_FILE.write_text(json.dumps(diary, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+def append_diary_record(date: str, record: dict):
+    with DIARY_LOCK:
+        diary = load_diary()
+        diary.setdefault(date, []).append(record)
+        save_diary(dedup_diary(diary))
+
 def dedup_diary(diary):
-    """对每天的记录按 narrative 去重，保留第一条"""
+    """仅按记录 ID 去重；不同输入即使叙事相同也必须保留。"""
     for date, items in diary.items():
         seen = set()
         unique = []
         for item in items:
-            nar = item.get("narrative", "")
-            if nar in seen:
+            record_id = item.get("id")
+            if record_id and record_id in seen:
                 continue
-            seen.add(nar)
+            if record_id:
+                seen.add(record_id)
             unique.append(item)
         diary[date] = unique
     return diary
@@ -257,10 +280,58 @@ def generate_narrative(user_input: str) -> str:
     return result
 
 
-def process_image(image_data: bytes) -> str:
+def generate_demo_image_narrative(image_data: bytes, input_type: str) -> str:
+    """无视觉模型时，根据真实像素特征生成不同的叙事，避免固定音频。"""
+    try:
+        with Image.open(io.BytesIO(image_data)) as source:
+            image = source.convert("RGB")
+            image.thumbnail((160, 160))
+            pixels = list(image.getdata())
+    except Exception:
+        return "这份画面被轻轻收进了今天。哪怕暂时说不清它的形状，它依然是此刻真实留下的一点回声。"
+
+    if not pixels:
+        return "空白也有自己的声音。它像一次安静的停顿，提醒你此刻仍然可以慢下来，听见自己的呼吸。"
+
+    count = len(pixels)
+    red = sum(pixel[0] for pixel in pixels) / count
+    green = sum(pixel[1] for pixel in pixels) / count
+    blue = sum(pixel[2] for pixel in pixels) / count
+    brightness = (red + green + blue) / 3
+    spread = max(red, green, blue) - min(red, green, blue)
+    ink_ratio = sum(1 for pixel in pixels if min(pixel) < 235) / count
+
+    if spread < 16:
+        color_phrase = "安静的灰白"
+    elif red >= green and red >= blue:
+        color_phrase = "温暖的红棕"
+    elif green >= red and green >= blue:
+        color_phrase = "柔和的青绿"
+    else:
+        color_phrase = "清澈的蓝紫"
+
+    light_phrase = "明亮轻盈" if brightness > 190 else "沉静柔和" if brightness > 105 else "深邃安静"
+    variants = [
+        "像一片刚刚停住的风，把没有说出口的心情留在纸面上",
+        "像窗边落下的一束光，让普通的瞬间也有了被记住的理由",
+        "像一次不必解释的呼吸，慢慢把此刻从忙乱中捧了出来",
+        "像一封写给今天的短信，字不多，却保留着真实的温度",
+        "像水面轻轻荡开的纹路，让细小的感受也拥有自己的方向",
+        "像一颗刚刚发芽的种子，在安静里保存着继续生长的力量",
+    ]
+    variant = variants[hashlib.sha256(image_data).digest()[0] % len(variants)]
+
+    if input_type == "doodle":
+        density = "几笔留白" if ink_ratio < 0.08 else "疏落的线条" if ink_ratio < 0.28 else "饱满的笔触"
+        return f"这幅涂鸦里有{density}，也有{color_phrase}的气息，整体显得{light_phrase}。它{variant}。不必画得完整，你留下的每一道痕迹，都已经在替此刻说话。"
+
+    return f"这张照片带着{color_phrase}的气息，画面的光线{light_phrase}。它{variant}。你愿意按下快门的那个瞬间，本身就是今天值得珍藏的一小段回声。"
+
+
+def process_image(image_data: bytes, input_type: str = "image") -> str:
     """处理图片：视觉理解 -> 叙事"""
     if not OPENAI_API_KEY:
-        return "照片里的光影，像是你给自己的礼物。今天有什么被记录下来了？"
+        return generate_demo_image_narrative(image_data, input_type)
 
     # Step 1: 图片内容理解
     desc, err = llm_vision(image_data, VISION_PROMPT)
@@ -284,8 +355,13 @@ def transcribe_audio(audio_data: bytes, filename="voice.webm") -> str:
 
     try:
         # 构建文件
-        files = {"file": (filename, io.BytesIO(audio_data), "audio/webm")}
-        data = {"model": "SenseVoice", "language": "zh"}
+        suffix = Path(filename).suffix.lower()
+        audio_mime = {
+            ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "audio/mp4",
+            ".ogg": "audio/ogg", ".wav": "audio/wav", ".webm": "audio/webm",
+        }.get(suffix, "application/octet-stream")
+        files = {"file": (filename, io.BytesIO(audio_data), audio_mime)}
+        data = {"model": WHISPER_MODEL, "language": "zh"}
         headers = {"Authorization": f"Bearer {WHISPER_API_KEY}"}
 
         resp = requests.post(
@@ -306,28 +382,19 @@ def transcribe_audio(audio_data: bytes, filename="voice.webm") -> str:
 # ========================
 # TTS 音频生成
 # ========================
-def generate_tts(text: str) -> str | None:
-    """调用 db.heang.top 生成 TTS 音频，返回公开 MP3 URL"""
+def _generate_tts_chunk(text: str) -> str | None:
+    """生成不超过 5000 字的单段音频。"""
     if not DOBAO_TTS_PASSWORD:
         print("[TTS] 未配置 DOBAO_TTS_PASSWORD，跳过 TTS 生成")
         return None
 
     try:
-        import base64
         auth = base64.b64encode(f"{DOBAO_TTS_USER}:{DOBAO_TTS_PASSWORD}".encode()).decode()
         resp = requests.post(
             f"{DOBAO_TTS_URL}/api/tts",
-            headers={
-                "Authorization": f"Basic {auth}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text,
-                "speaker": DOBAO_TTS_VOICE,
-                "rate": 0,
-                "pitch": 0,
-            },
-            timeout=30,  # 从 180s 降到 30s，避免前端超时
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+            json={"text": text, "speaker": DOBAO_TTS_VOICE, "rate": 0, "pitch": 0},
+            timeout=90,
         )
         resp.raise_for_status()
         data = resp.json().get("data", resp.json())
@@ -335,10 +402,193 @@ def generate_tts(text: str) -> str | None:
         if audio_url and audio_url.startswith("/"):
             audio_url = f"{DOBAO_TTS_URL}{audio_url}"
         return audio_url
-    except Exception as e:
-        print(f"[TTS 失败] {e}")
+    except Exception as exc:
+        print(f"[TTS 分段失败] {exc}")
         return None
 
+
+def _split_tts_text(text: str, limit: int = 4500) -> list[str]:
+    """按段落/句号切分长文，每段严格小于服务上限。"""
+    text = text.strip()
+    chunks = []
+    while len(text) > limit:
+        cut = max(text.rfind(mark, 0, limit) for mark in ("\n", "。", "！", "？", "；", ".", "!", "?"))
+        if cut < limit // 2:
+            cut = limit
+        else:
+            cut += 1
+        chunks.append(text[:cut].strip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def generate_tts(text: str) -> str | None:
+    """长文顺序分段生成；多段时合并为一个可播放 MP3。"""
+    chunks = _split_tts_text(text)
+    if not chunks:
+        return None
+    urls = []
+    for index, chunk in enumerate(chunks, 1):
+        print(f"[TTS] 正在生成第 {index}/{len(chunks)} 段，{len(chunk)} 字")
+        url = _generate_tts_chunk(chunk)
+        if not url:
+            return None
+        urls.append(url)
+    if len(urls) == 1:
+        return urls[0]
+
+    merge_id = uuid.uuid4().hex
+    parts = []
+    list_file = AUDIO_DIR / f".{merge_id}.txt"
+    output_file = AUDIO_DIR / f"{merge_id}.mp3"
+    try:
+        for index, url in enumerate(urls):
+            part = AUDIO_DIR / f".{merge_id}-{index}.mp3"
+            response = requests.get(url, timeout=90)
+            response.raise_for_status()
+            part.write_bytes(response.content)
+            parts.append(part)
+        list_file.write_text("".join(f"file '{part}'\n" for part in parts), encoding="utf-8")
+        subprocess.run(
+            ["/usr/bin/ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(output_file)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120,
+        )
+        return f"/api/audio/{output_file.name}"
+    except Exception as exc:
+        print(f"[TTS 合并失败] {exc}")
+        return None
+    finally:
+        for path in [*parts, list_file]:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _run_long_text_job(job_id: str, user_content: str, theme: str):
+    """后台完成长文叙事、图片和完整原文音频，避免浏览器连接超时。"""
+    try:
+        narrative = generate_narrative(user_content)
+        image_url = generate_image(narrative)
+        audio_url = generate_tts(user_content)
+        if not audio_url:
+            raise RuntimeError("长文音频生成失败，请稍后重试")
+        echo_id = uuid.uuid4().hex[:8]
+        today = str(datetime.date.today())
+        record = {
+            "id": echo_id, "theme": theme, "user_input": user_content,
+            "input_type": "text", "narrative": narrative,
+            "audio_url": audio_url, "image_url": image_url,
+            "audio_mode": "full_text", "created_at": datetime.datetime.now().isoformat(),
+        }
+        append_diary_record(today, record)
+        result = {"status": "completed", "id": echo_id, "narrative": narrative,
+                  "audio_url": audio_url, "image_url": image_url, "date": today}
+    except Exception as exc:
+        print(f"[长文任务失败] {exc}")
+        result = {"status": "failed", "error": str(exc)}
+    with TTS_JOBS_LOCK:
+        TTS_JOBS[job_id] = result
+
+
+def _image_result_url(payload: dict) -> str | None:
+    """兼容 OpenAI 图片接口的 URL 与 b64_json 两种返回。"""
+    items = payload.get("data") or []
+    if not items:
+        return None
+    item = items[0]
+    if item.get("url"):
+        return item["url"]
+    encoded = item.get("b64_json")
+    if not encoded:
+        return None
+    try:
+        image_id = f"{uuid.uuid4().hex}.png"
+        (IMAGE_DIR / image_id).write_bytes(base64.b64decode(encoded, validate=True))
+        return f"/api/images/{image_id}"
+    except Exception as exc:
+        print(f"[生图解码失败] {exc}")
+        return None
+
+
+def save_uploaded_photo(image_data: bytes) -> str | None:
+    """保存用户原始照片的适配版本，照片流程不再调用 AI 生图。"""
+    try:
+        filename = f"photo-{uuid.uuid4().hex}.jpg"
+        with Image.open(io.BytesIO(image_data)) as source:
+            photo = source.convert("RGB")
+            photo.thumbnail((1600, 1600))
+            photo.save(IMAGE_DIR / filename, "JPEG", quality=88, optimize=True)
+        return f"/api/images/{filename}"
+    except Exception as exc:
+        print(f"[原图保存失败] {exc}")
+        return None
+
+
+def generate_image(narrative: str, reference_image: bytes | None = None) -> str | None:
+    """根据叙事生成治愈系画面；有照片/涂鸦时优先使用参考图。"""
+    if not IMAGE_API_KEY:
+        return None
+
+    prompt = (
+        "请根据下面的中文内容创作一张温暖、安静、细腻的治愈系插画。"
+        "保留输入中的核心意象和情绪，构图简洁，有自然光与手绘质感，"
+        "不要添加任何文字、水印、边框或界面元素。内容：" + narrative[:800]
+    )
+    headers = {"Authorization": f"Bearer {IMAGE_API_KEY}"}
+
+    # OpenAI-compatible image edit；不支持时自动回退到文生图。
+    if reference_image:
+        try:
+            resp = requests.post(
+                f"{IMAGE_BASE_URL}/images/edits",
+                headers=headers,
+                data={"model": IMAGE_MODEL, "prompt": prompt, "size": "1024x1024"},
+                files={"image": ("reference.png", io.BytesIO(reference_image), "image/png")},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            result = _image_result_url(resp.json())
+            if result:
+                return result
+        except Exception as exc:
+            print(f"[参考图生成失败，回退文生图] {exc}")
+
+    try:
+        resp = requests.post(
+            f"{IMAGE_BASE_URL}/images/generations",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"model": IMAGE_MODEL, "prompt": prompt, "size": "1024x1024", "n": 1},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return _image_result_url(resp.json())
+    except Exception as exc:
+        print(f"[生图失败] {exc}")
+        return None
+
+
+def _run_photo_image_job(echo_id: str, narrative: str, image_data: bytes):
+    """照片音频先完成；生成图随后成功时替换日历封面。"""
+    generated_url = generate_image(narrative, image_data)
+    with DIARY_LOCK:
+        diary = load_diary()
+        changed = False
+        for items in diary.values():
+            for item in items:
+                if item.get("id") != echo_id:
+                    continue
+                if generated_url:
+                    item["original_image_url"] = item.get("image_url")
+                    item["image_url"] = generated_url
+                    item["image_status"] = "generated"
+                else:
+                    item["image_status"] = "failed"
+                changed = True
+        if changed:
+            save_diary(diary)
 
 # ========================
 # API 路由
@@ -372,6 +622,7 @@ def api_status():
         "has_api_key": bool(OPENAI_API_KEY),
         "has_whisper": bool(WHISPER_API_KEY),
         "has_tts": bool(DOBAO_TTS_PASSWORD),
+        "has_image_generation": bool(IMAGE_API_KEY),
         "message": "Demo 模式：语音识别和 TTS 使用占位文本" if demo_mode else "正常模式",
     })
 
@@ -406,11 +657,25 @@ def api_generate():
     theme = data.get("theme", "")
 
     # ---- 文字输入 ----
+    reference_image = None
     if input_type == "text":
         user_content = data.get("content", "").strip()
         if not user_content:
             return jsonify({"error": "内容不能为空"}), 400
+        if len(user_content) > 20000:
+            return jsonify({"error": "长文暂时最多支持 20000 字"}), 400
+        if len(user_content) > 300:
+            job_id = uuid.uuid4().hex
+            with TTS_JOBS_LOCK:
+                TTS_JOBS[job_id] = {"status": "processing"}
+                if len(TTS_JOBS) > 100:
+                    oldest = next(iter(TTS_JOBS))
+                    if oldest != job_id:
+                        TTS_JOBS.pop(oldest, None)
+            threading.Thread(target=_run_long_text_job, args=(job_id, user_content, theme), daemon=True).start()
+            return jsonify({"pending": True, "job_id": job_id}), 202
         narrative = generate_narrative(user_content)
+        tts_text = user_content if len(user_content) > 300 else narrative
 
     # ---- 图片 / 涂鸦输入 ----
     elif input_type in ("image", "doodle"):
@@ -423,9 +688,11 @@ def api_generate():
             if img_b64.startswith("data:"):
                 img_b64 = img_b64.split(",", 1)[1]
             image_data = base64.b64decode(img_b64, validate=True)
+            reference_image = image_data
         except Exception:
             return jsonify({"error": "图片或涂鸦格式错误"}), 400
-        narrative = process_image(image_data)
+        narrative = process_image(image_data, input_type)
+        tts_text = narrative
 
     # ---- 语音输入 ----
     elif input_type == "voice":
@@ -435,14 +702,14 @@ def api_generate():
     else:
         return jsonify({"error": f"不支持的类型: {input_type}"}), 400
 
-    # 生成音频
+    # 根据输入内容生成专属图片与音频
     echo_id = uuid.uuid4().hex[:8]
-    audio_url = generate_tts(narrative)
+    # 照片和涂鸦都先保留用户原图；涂鸦不再调用 Image2 重画。
+    image_url = save_uploaded_photo(reference_image) if input_type in ("image", "doodle") else generate_image(narrative, reference_image)
+    audio_url = generate_tts(tts_text)
 
     # 保存日记
-    diary = load_diary()
     today = str(datetime.date.today())
-    diary.setdefault(today, [])
     record = {
         "id": echo_id,
         "theme": theme,
@@ -450,16 +717,20 @@ def api_generate():
         "input_type": input_type,
         "narrative": narrative,
         "audio_url": audio_url,
+        "image_url": image_url,
+        "image_status": "processing" if input_type == "image" and IMAGE_API_KEY else "original" if input_type == "doodle" and image_url else "generated" if image_url else "unavailable",
+        "audio_mode": "full_text" if input_type == "text" and len(user_content) > 300 else "narrative",
         "created_at": datetime.datetime.now().isoformat(),
     }
-    diary[today].append(record)
-    dedup_diary(diary)
-    save_diary(diary)
+    append_diary_record(today, record)
+    if input_type == "image" and IMAGE_API_KEY:
+        threading.Thread(target=_run_photo_image_job, args=(echo_id, narrative, reference_image), daemon=True).start()
 
     return jsonify({
         "id": echo_id,
         "narrative": narrative,
         "audio_url": audio_url,
+        "image_url": image_url,
         "date": today,
     })
 
@@ -482,8 +753,9 @@ def api_echo_voice():
     # Step 2: AI 生成叙事
     narrative = generate_narrative(f"用户语音输入：{transcribed}")
 
-    # Step 3: TTS 生成音频（可能为 None，不影响主体流程）
+    # Step 3: 根据识别后的内容生成图片，并生成 TTS 音频
     echo_id = uuid.uuid4().hex[:8]
+    image_url = generate_image(narrative)
     try:
         audio_url = generate_tts(narrative)
     except Exception as e:
@@ -491,33 +763,45 @@ def api_echo_voice():
         audio_url = None
 
     # 保存
-    diary = load_diary()
     today = str(datetime.date.today())
-    diary.setdefault(today, [])
-    diary[today].append({
+    append_diary_record(today, {
         "id": echo_id,
         "theme": theme,
         "user_input": transcribed,
         "input_type": "voice",
         "narrative": narrative,
         "audio_url": audio_url,
+        "image_url": image_url,
         "created_at": datetime.datetime.now().isoformat(),
     })
-    dedup_diary(diary)
-    save_diary(diary)
 
     return jsonify({
         "id": echo_id,
         "transcribed": transcribed,
         "narrative": narrative,
         "audio_url": audio_url,
+        "image_url": image_url,
         "date": today,
     })
+
+
+@app.route("/api/echo/jobs/<job_id>")
+def api_echo_job(job_id):
+    with TTS_JOBS_LOCK:
+        job = TTS_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    return jsonify(job)
 
 
 @app.route("/api/audio/<filename>")
 def api_audio(filename):
     return send_from_directory(AUDIO_DIR, filename)
+
+
+@app.route("/api/images/<filename>")
+def api_image(filename):
+    return send_from_directory(IMAGE_DIR, filename)
 
 
 @app.route("/api/diary")
